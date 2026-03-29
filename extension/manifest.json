@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "MetaGuard Companion",
+  "version": "1.0",
+  "description": "Analyze image and document metadata before uploading or sharing.",
+  "permissions": ["activeTab", "storage"],
+  "host_permissions": [
+    "http://127.0.0.1:5000/*"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  }
+}
