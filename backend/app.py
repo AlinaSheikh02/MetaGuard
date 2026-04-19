@@ -2,6 +2,8 @@ import os
 import uuid
 import sqlite3
 import jwt
+import zipfile
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from flask import Flask, request, jsonify, send_file
@@ -56,11 +58,10 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
     ''')
-    # Migrate history to add user_id if not exists
     try:
         c.execute("ALTER TABLE history ADD COLUMN user_id TEXT")
     except sqlite3.OperationalError:
-        pass # Column might already exist
+        pass 
     conn.commit()
     conn.close()
 
@@ -129,6 +130,21 @@ def login():
     
     return jsonify({'token': token, 'username': username})
 
+def get_decimal_from_dms(dms, ref):
+    try:
+        degrees = dms[0][0] / dms[0][1]
+        minutes = dms[1][0] / dms[1][1] / 60.0
+        seconds = dms[2][0] / dms[2][1] / 3600.0
+        
+        if ref in ['S', 'W']:
+            degrees = -degrees
+            minutes = -minutes
+            seconds = -seconds
+            
+        return round(degrees + minutes + seconds, 5)
+    except:
+        return None
+
 def get_geotagging(exif):
     if not exif:
         return None
@@ -148,6 +164,7 @@ def extract_metadata_image(image_path, filename):
         exif_raw = image._getexif()
         metadata = []
         high_risk, med_risk, low_risk = 0, 0, 0
+        lat, lng = None, None
         
         metadata.append({"key": "Format", "value": image.format, "risk": "Low"})
         metadata.append({"key": "Size", "value": f"{os.path.getsize(image_path) / 1024:.2f} KB", "risk": "Low"})
@@ -155,7 +172,7 @@ def extract_metadata_image(image_path, filename):
         low_risk += 3
 
         if not exif_raw:
-            return metadata, 100, "Safe"
+            return metadata, 100, "Safe", None, None
 
         for tag_id in exif_raw:
             tag = TAGS.get(tag_id, tag_id)
@@ -183,17 +200,26 @@ def extract_metadata_image(image_path, filename):
         if geo_info:
             metadata.append({"key": "GPS Coordinates", "value": "Present", "risk": "Critical"})
             high_risk += 2
+            
+            gps_lat = geo_info.get("GPSLatitude")
+            gps_lat_ref = geo_info.get("GPSLatitudeRef")
+            gps_lng = geo_info.get("GPSLongitude")
+            gps_lng_ref = geo_info.get("GPSLongitudeRef")
+            
+            if gps_lat and gps_lat_ref and gps_lng and gps_lng_ref:
+                lat = get_decimal_from_dms(gps_lat, gps_lat_ref)
+                lng = get_decimal_from_dms(gps_lng, gps_lng_ref)
+            
             for g_key, g_val in geo_info.items():
                  metadata.append({"key": f"GPS {g_key}", "value": str(g_val), "risk": "Critical"})
                  
         score = max(0, 100 - (high_risk * 25) - (med_risk * 10))
         risk_level = "High" if high_risk > 0 else "Medium" if med_risk > 0 else "Low"
-        return metadata, score, risk_level
+        return metadata, score, risk_level, lat, lng
     except Exception as e:
         print(f"Error extracting image metadata: {e}")
-        return [{"key": "Error", "value": "Could not extract metadata", "risk": "Low"}], 100, "Safe"
+        return [{"key": "Error", "value": "Could not extract metadata", "risk": "Low"}], 100, "Safe", None, None
 
-        
 def extract_metadata_doc(file_path, filename, ext):
     metadata = []
     high_risk, med_risk, low_risk = 0, 0, 0
@@ -210,27 +236,42 @@ def extract_metadata_doc(file_path, filename, ext):
                     k_str = str(k).strip('/')
                     v_str = str(v)
                     risk = "Medium"
-                    if k_str in ['Author', 'Creator', 'Producer']: risk = "High"; high_risk += 1
+                    if k_str in ['Author', 'Creator', 'Producer']: risk = "Critical"; high_risk += 1
                     else: med_risk += 1
                     metadata.append({"key": k_str, "value": v_str[:100], "risk": risk})
         elif ext == 'docx':
             doc = Document(file_path)
             props = doc.core_properties
-            if props.author: metadata.append({"key": "Author", "value": props.author, "risk": "High"}); high_risk += 1
-            if props.last_modified_by: metadata.append({"key": "Last Modified By", "value": props.last_modified_by, "risk": "High"}); high_risk += 1
+            if props.author: metadata.append({"key": "Author PC / Creator", "value": props.author, "risk": "Critical"}); high_risk += 1
+            if props.last_modified_by: metadata.append({"key": "Last Modified By", "value": props.last_modified_by, "risk": "Critical"}); high_risk += 1
             if props.created: metadata.append({"key": "Created", "value": str(props.created), "risk": "Medium"}); med_risk += 1
             if props.modified: metadata.append({"key": "Modified", "value": str(props.modified), "risk": "Medium"}); med_risk += 1
+            
+            try:
+                import xml.etree.ElementTree as ET
+                from zipfile import ZipFile
+                with ZipFile(file_path, 'r') as docx_zip:
+                    app_xml = docx_zip.read('docProps/app.xml')
+                    root = ET.fromstring(app_xml)
+                    namespaces = {'ap': 'http://schemas.openxmlformats.org/officeDocument/2006/extended-properties'}
+                    edit_time = root.find('.//ap:TotalTime', namespaces)
+                    if edit_time is not None and edit_time.text:
+                        metadata.append({"key": "Total Editing Time", "value": f"{edit_time.text} minutes", "risk": "High"})
+                        high_risk += 1
+            except:
+                pass
+
         elif ext == 'xlsx':
             wb = load_workbook(file_path)
             props = wb.properties
-            if props.creator: metadata.append({"key": "Creator", "value": props.creator, "risk": "High"}); high_risk += 1
-            if props.lastModifiedBy: metadata.append({"key": "Last Modified By", "value": props.lastModifiedBy, "risk": "High"}); high_risk += 1
+            if props.creator: metadata.append({"key": "Creator", "value": props.creator, "risk": "Critical"}); high_risk += 1
+            if props.lastModifiedBy: metadata.append({"key": "Last Modified By", "value": props.lastModifiedBy, "risk": "Critical"}); high_risk += 1
             if props.created: metadata.append({"key": "Created", "value": str(props.created), "risk": "Medium"}); med_risk += 1
         elif ext == 'pptx':
             prs = Presentation(file_path)
             props = prs.core_properties
-            if props.author: metadata.append({"key": "Author", "value": props.author, "risk": "High"}); high_risk += 1
-            if props.last_modified_by: metadata.append({"key": "Last Modified By", "value": props.last_modified_by, "risk": "High"}); high_risk += 1
+            if props.author: metadata.append({"key": "Author", "value": props.author, "risk": "Critical"}); high_risk += 1
+            if props.last_modified_by: metadata.append({"key": "Last Modified By", "value": props.last_modified_by, "risk": "Critical"}); high_risk += 1
             if props.created: metadata.append({"key": "Created", "value": str(props.created), "risk": "Medium"}); med_risk += 1
     except Exception as e:
         print(f"Error extracting doc metadata: {e}")
@@ -241,19 +282,14 @@ def extract_metadata_doc(file_path, filename, ext):
 
 def clean_image(input_path, output_path, share_safe=False):
     image = Image.open(input_path)
-    
     if share_safe:
-        # Resize to max 1080p for social media sharing
         max_size = (1080, 1080)
         image.thumbnail(max_size, Image.Resampling.LANCZOS)
-    
     data = list(image.getdata())
     image_without_exif = Image.new(image.mode, image.size)
     image_without_exif.putdata(data)
     
     if share_safe and image.format in ['JPEG', 'PNG']:
-        # Compress and save as JPEG to remove any extra metadata embedded in PNG chunks
-        # Convert RGBA to RGB if needed
         if image_without_exif.mode in ("RGBA", "P"):
             image_without_exif = image_without_exif.convert("RGB")
         image_without_exif.save(output_path, "JPEG", quality=80)
@@ -285,6 +321,27 @@ def clean_doc(input_path, output_path, ext):
             doc.core_properties.last_modified_by = ""
             doc.core_properties.comments = ""
             doc.save(output_path)
+            
+            try:
+                import xml.etree.ElementTree as ET
+                from zipfile import ZipFile
+                with ZipFile(output_path, 'r') as zin:
+                    with zipfile.ZipFile(output_path + "_temp", 'w') as zout:
+                        for item in zin.infolist():
+                            buffer = zin.read(item.filename)
+                            if item.filename == 'docProps/app.xml':
+                                root = ET.fromstring(buffer)
+                                namespaces = {'ap': 'http://schemas.openxmlformats.org/officeDocument/2006/extended-properties'}
+                                edit_time = root.find('.//ap:TotalTime', namespaces)
+                                if edit_time is not None:
+                                    edit_time.text = "0"
+                                buffer = ET.tostring(root)
+                            zout.writestr(item, buffer)
+                os.remove(output_path)
+                os.rename(output_path + "_temp", output_path)
+            except:
+                pass
+
         elif ext == 'xlsx':
             wb = load_workbook(input_path)
             wb.properties.creator = ""
@@ -297,65 +354,119 @@ def clean_doc(input_path, output_path, ext):
             prs.save(output_path)
     except Exception as e:
         print(f"Doc cleaning error: {e}")
-        # Falback copy
         import shutil
         shutil.copyfile(input_path, output_path)
 
-
-@app.route('/api/analyze', methods=['POST'])
-def analyze():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file part"}), 400
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
-        
-    share_safe = request.form.get('share_safe', 'false').lower() == 'true'
-    
+def process_single_file(file, share_safe, req_user_id):
     ext = file.filename.split('.')[-1].lower()
     allowed_images = ['jpg', 'jpeg', 'png']
     allowed_docs = ['pdf', 'docx', 'xlsx', 'pptx']
     
     if ext not in allowed_images and ext not in allowed_docs:
-        return jsonify({"error": "Unsupported file format"}), 400
+        return {"error": f"Unsupported format: {ext}", "filename": file.filename}
 
     file_id = str(uuid.uuid4())
     filename = f"{file_id}.{ext}"
     input_path = os.path.join(UPLOAD_FOLDER, filename)
     
-    # Enforce safe filename, but we are using GUID anyway
     output_filename = filename
     if share_safe and ext in allowed_images:
-        output_filename = f"{file_id}.jpg" # share safe converts to jpg
+        output_filename = f"{file_id}.jpg"
         
     output_path = os.path.join(CLEAN_FOLDER, output_filename)
     file.save(input_path)
     
+    lat, lng = None, None
     if ext in allowed_images:
-        metadata, score, risk_level = extract_metadata_image(input_path, filename)
+        metadata, score, risk_level, lat, lng = extract_metadata_image(input_path, filename)
         clean_image(input_path, output_path, share_safe)
     else:
         metadata, score, risk_level = extract_metadata_doc(input_path, filename, ext)
         clean_doc(input_path, output_path, ext)
         
-    # User associated logic
-    user_id = get_optional_user()
-    if user_id:
+    if req_user_id:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute('INSERT INTO history (id, user_id, filename, upload_date, score, risk_level) VALUES (?, ?, ?, ?, ?, ?)',
-                  (file_id, user_id, file.filename, datetime.now(timezone.utc).isoformat(), score, risk_level))
+                  (file_id, req_user_id, file.filename, datetime.now(timezone.utc).isoformat(), score, risk_level))
         conn.commit()
         conn.close()
     
-    return jsonify({
+    return {
         "id": file_id,
         "filename": file.filename,
         "metadata": metadata,
         "score": score,
         "risk_level": risk_level,
+        "lat": lat,
+        "lng": lng,
         "clean_url": f"/api/download/{output_filename}"
-    })
+    }
+
+@app.route('/api/analyze', methods=['POST'])
+def analyze():
+    files = request.files.getlist('files')
+    if not files and 'file' in request.files:
+        files = [request.files['file']]
+        
+    if not files:
+        return jsonify({"error": "No selected files"}), 400
+        
+    share_safe = request.form.get('share_safe', 'false').lower() == 'true'
+    user_id = get_optional_user()
+    
+    reports = []
+    for f in files:
+        if f.filename == '':
+            continue
+        res = process_single_file(f, share_safe, user_id)
+        reports.append(res)
+        
+    if not reports:
+        return jsonify({"error": "No valid files processed"}), 400
+
+    if len(reports) == 1 and 'file' in request.files:
+         if "error" in reports[0]:
+             return jsonify(reports[0]), 400
+         return jsonify(reports[0])
+
+    return jsonify({"reports": reports})
+
+@app.route('/api/analyze-batch', methods=['POST'])
+def analyze_batch():
+    files = request.files.getlist('files')
+    if not files:
+        return jsonify({"error": "No selected files"}), 400
+        
+    share_safe = request.form.get('share_safe', 'false').lower() == 'true'
+    user_id = get_optional_user()
+    
+    reports = []
+    for f in files:
+        if f.filename == '':
+            continue
+        res = process_single_file(f, share_safe, user_id)
+        reports.append(res)
+        
+    return jsonify({"reports": reports})
+
+@app.route('/api/download-batch', methods=['POST'])
+def download_batch():
+    data = request.json
+    filenames = data.get('filenames', [])
+    if not filenames:
+        return jsonify({"error": "No filenames provided"}), 400
+
+    memory_file = BytesIO()
+    with zipfile.ZipFile(memory_file, 'w') as zf:
+        for fname in filenames:
+            actual_file = fname.replace('/api/download/', '')
+            file_path = os.path.join(CLEAN_FOLDER, actual_file)
+            if os.path.exists(file_path):
+                zf.write(file_path, actual_file)
+    
+    memory_file.seek(0)
+    return send_file(memory_file, download_name='cleaned_batch.zip', as_attachment=True)
 
 @app.route('/api/download/<filename>', methods=['GET'])
 def download(filename):
